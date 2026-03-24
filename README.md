@@ -1,120 +1,111 @@
 # Jannus
 
-**Jannus** nhận sự kiện từ GitHub (webhook), cập nhật bản clone local (`git pull`), rồi gọi **Claude Code** qua CLI (`claude -p "<prompt>"`) để phân tích và sửa code theo quy tắc an toàn (branch mới, PR, không đụng secrets).
+**Jannus** is a **multi-agent** system: GitHub webhooks feed a **LangGraph** orchestrator (planner → repo workspace → prompt → **Claude Code** CLI → reviewer → optional human-in-the-loop via **Telegram**). **LangSmith** traces runs when configured. Optional **LlamaIndex + Chroma** RAG augments prompts.
 
-## Kiến trúc (3 lớp)
-
-Luồng xử lý: **Trigger → Prompt → Executor**.
+## Architecture
 
 ```mermaid
-flowchart LR
-    GH["GitHub"] --> T
-    subgraph trigger [Layer 1 Trigger]
-        T["webhook.py\nHTTP + HMAC + filters"]
+flowchart TB
+    GH[GitHub Webhook] --> T[Trigger FastAPI]
+    T --> G[LangGraph]
+    subgraph agents [Agents]
+        P[Planner]
+        R[RepoManager]
+        B[PromptBuilder]
+        E[Executor claude -p]
+        V[Reviewer GPT-4o]
+        N1[notifier_prepare Telegram]
+        N2[notifier_interrupt]
+        P --> R --> B --> E --> V
+        V -->|needs_human or max_attempts| N1 --> N2 --> B
     end
-    subgraph prompt [Layer 2 Prompt]
-        B["builder.py\nEvent to Claude prompt"]
-    end
-    subgraph executor [Layer 3 Executor]
-        R["runner.py\ngit pull then claude -p"]
-    end
-    T --> B --> R
-    R --> Out["Branch and PR on GitHub"]
+    G --> agents
+    CB[POST /callback] -->|Command resume| N2
 ```
 
-| Layer | Package | Trách nhiệm |
-|-------|---------|-------------|
-| **1. Trigger** | [`jannus/trigger/`](jannus/trigger/) | Nhận `POST /webhook`, xác thực chữ ký GitHub, lọc event/repo allowlist. |
-| **2. Prompt** | [`jannus/prompt/`](jannus/prompt/) | Chuyển payload GitHub thành chuỗi prompt (kèm quy tắc an toàn); có thể trả `None` để bỏ qua. |
-| **3. Executor** | [`jannus/executor/`](jannus/executor/) | `git pull --ff-only`, sau đó chạy `claude -p`; một job tại một thời điểm (khóa). |
+| Layer | Location | Role |
+|-------|----------|------|
+| Trigger | [`jannus/trigger/`](jannus/trigger/) | `POST /webhook` (GitHub HMAC), `POST /callback` (resume after human input) |
+| Orchestration | [`jannus/agents/graph.py`](jannus/agents/graph.py) | LangGraph + SQLite checkpoints |
+| Agents | [`jannus/agents/`](jannus/agents/) | Planner, repo clone/pull, prompt, executor, reviewer, notifier |
+| RAG (optional) | [`jannus/rag/`](jannus/rag/) | LlamaIndex + Chroma under `workspaces/.chroma/` |
 
-## Yêu cầu
+Persistent clones live in **`workspaces/`** (gitignored except `.gitkeep`), e.g. `workspaces/owner--repo/`.
 
-- Python 3.10+ (khuyến nghị 3.12+)
-- [Claude Code](https://docs.anthropic.com/) đã cài và đăng nhập (`claude` trong `PATH`)
-- Một bản clone local của repo GitHub (remote để `git pull` hoạt động)
+## Requirements
 
-## Cài đặt nhanh
+- Python 3.10+ (3.12+ recommended; 3.14 may show LangChain pydantic warnings)
+- [Claude Code](https://docs.anthropic.com/) CLI (`claude` on `PATH`)
+- OpenAI API key recommended (planner + reviewer heuristics work without it, with lower quality)
+
+## Quick start
 
 ```bash
 cd /path/to/Jannus
 python3 -m venv .venv
-source .venv/bin/activate   # Windows: .venv\Scripts\activate
+source .venv/bin/activate
 pip install -r requirements.txt
 cp .env.example .env
-# Sửa .env: REPO_PATH= đường dẫn tuyệt đối tới clone repo
-```
-
-## Chạy service
-
-```bash
+# Edit .env: WEBHOOK_SECRET, OPENAI_API_KEY, TELEGRAM_* if needed
 python -m jannus
 ```
 
-Mặc định lắng nghe `http://0.0.0.0:8765`. Kiểm tra: `GET /health`.
+- Health: `GET /health`
+- GitHub webhook: `POST /webhook`
+- Resume after Telegram / manual human input: `POST /callback` with JSON `{"thread_id": "<id from webhook response>", "message": "your guidance"}`
 
-## Cấu hình GitHub Webhook
+## Environment variables
 
-1. Repo GitHub → **Settings** → **Webhooks** → **Add webhook**
-2. **Payload URL**: `https://<host-công-khai>/webhook` (dev có thể dùng [ngrok](https://ngrok.com/))
-3. **Content type**: `application/json`
-4. **Secret**: giống biến `WEBHOOK_SECRET` trong `.env`
-5. Chọn các event cần dùng (ví dụ: **Push**, **Issues**, **Issue comments**, **Workflow runs**, **Check suites**)
+| Variable | Description |
+|----------|-------------|
+| `WORKSPACES_DIR` | Directory for git clones + SQLite checkpoint DB (default: `./workspaces`) |
+| `WEBHOOK_SECRET` | GitHub webhook secret; empty skips signature check (dev only) |
+| `EVENT_ALLOWLIST` | Comma-separated GitHub events; empty allows all handled types |
+| `REPO_ALLOWLIST` | Comma-separated `owner/repo`; empty allows any |
+| `TRIGGER_KEYWORDS` | Substrings required in `issue_comment` bodies |
+| `WEBHOOK_DRY_RUN` | If `true`, skips real `git`/`claude` (still runs graph) |
+| `MAX_ATTEMPTS` | Review loop limit before escalating to human path |
+| `CLAUDE_BIN`, `CLAUDE_EXTRA_ARGS`, `CLAUDE_TIMEOUT` | Claude Code invocation |
+| `OPENAI_API_KEY`, `OPENAI_MODEL` | Planner and reviewer LLM |
+| `LANGCHAIN_TRACING_V2`, `LANGCHAIN_API_KEY`, `LANGCHAIN_PROJECT` | LangSmith tracing |
+| `TELEGRAM_BOT_TOKEN`, `TELEGRAM_CHAT_ID` | Notifications before `interrupt()` |
+| `RAG_ENABLED` | `true` requires `pip install -r requirements-rag.txt` |
 
-Service trả **202 Accepted** khi đã xếp job nền; GitHub không cần chờ Claude chạy xong.
+## LangSmith
 
-## Biến môi trường
+Set `LANGCHAIN_TRACING_V2=true` and `LANGCHAIN_API_KEY` (and optionally `LANGCHAIN_PROJECT`). Graph and LLM calls are traced at [smith.langchain.com](https://smith.langchain.com).
 
-| Biến | Mô tả |
-|------|--------|
-| `REPO_PATH` | Đường dẫn tuyệt đối tới thư mục git clone (bắt buộc). |
-| `HOST` / `PORT` | Bind server (mặc định `0.0.0.0`, `8765`). |
-| `WEBHOOK_SECRET` | Secret webhook GitHub; để trống chỉ dùng khi dev (không xác thực chữ ký). |
-| `EVENT_ALLOWLIST` | Danh sách event, cách nhau bởi dấu phẩy; rỗng = chấp nhận mọi event được hỗ trợ. |
-| `REPO_ALLOWLIST` | Chỉ chấp nhận `owner/repo` trong danh sách; rỗng = mọi repo. |
-| `TRIGGER_KEYWORDS` | Với **Issue comment**: comment phải chứa một trong các chuỗi (mặc định `/fix`, `/autofix`, `@jannus`). |
-| `WEBHOOK_DRY_RUN` | `true` = chỉ log prompt, không `git pull` / không gọi `claude`. |
-| `CLAUDE_BIN` | Tên lệnh CLI (mặc định `claude`). |
-| `CLAUDE_EXTRA_ARGS` | Thêm tham số sau `-p`, cách nhau khoảng trắng (ví dụ `--max-turns 20`). |
-| `CLAUDE_TIMEOUT` | Timeout giây cho tiến trình Claude (mặc định `600`). |
+## Optional RAG
 
-## Sự kiện được xử lý
+```bash
+pip install -r requirements-rag.txt
+# In .env:
+RAG_ENABLED=true
+```
 
-| Event | Hành vi tóm tắt |
-|-------|-----------------|
-| `push` | Prompt theo ref và commit messages. |
-| `issues` | `opened`, `reopened`, `labeled`, `assigned` → prompt theo title/body issue. |
-| `issue_comment` | Chỉ `created` **và** comment khớp `TRIGGER_KEYWORDS` → prompt theo issue + comment. |
-| `workflow_run` | Kết thúc với kết luận lỗi → prompt theo log/branch. |
-| `check_suite` | Kết luận lỗi → prompt điều tra CI. |
-| Khác | Fallback: gửi payload rút gọn cho Claude đánh giá. |
+Uses OpenAI embeddings; indexes live under `workspaces/.chroma/`.
 
-### Ví dụ comment để kích hoạt
+## GitHub webhook setup
 
-Trong issue hoặc PR, comment có chứa một từ khóa, ví dụ:
+1. Repository **Settings → Webhooks → Add webhook**
+2. Payload URL: `https://your-host/webhook`
+3. Content type: `application/json`
+4. Secret: match `WEBHOOK_SECRET`
+5. Select events: e.g. Push, Issues, Issue comments, Workflow runs, Check suites
 
-- `/fix lỗi null ở getUser`
-- `/autofix`
-- `@jannus hãy sửa test fail`
+The server responds **202** with a `thread_id` (GitHub delivery id) for correlation with LangSmith and `/callback`.
 
-Có thể tùy chỉnh qua `TRIGGER_KEYWORDS` (phân tách bằng dấu phẩy).
-
-## Cấu trúc thư mục
+## Project layout
 
 ```
 jannus/
-  __init__.py
-  __main__.py          # python -m jannus
-  config.py            # Settings + get_settings
-  trigger/
-    webhook.py         # FastAPI app, POST /webhook
-    security.py        # X-Hub-Signature-256
-  prompt/
-    builder.py         # build_prompt(...)
-  executor/
-    runner.py          # git pull, claude -p, job lock
+  agents/       # LangGraph nodes (planner, repo_manager, prompt_builder, executor, reviewer, notifier)
+  rag/          # Optional LlamaIndex + Chroma
+  trigger/      # FastAPI webhook + callback
+  config.py
+workspaces/     # Clones + .jannus_state.db (ignored)
 ```
 
 ## License
 
-Theo license của repository này (nếu có).
+Per repository license if present.

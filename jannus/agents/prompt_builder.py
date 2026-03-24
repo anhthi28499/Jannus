@@ -1,9 +1,15 @@
-"""Layer 2: Prompt — GitHub event + payload → Claude instruction string."""
+"""Build Claude prompt from GitHub event + graph state (review loop, RAG, human input)."""
 
 from __future__ import annotations
 
 import json
+import logging
 from typing import Any
+
+from jannus.agents.state import JannusState
+from jannus.config import Settings
+
+logger = logging.getLogger("jannus.prompt_builder")
 
 SAFETY_RULES = """
 QUY TẮC BẮT BUỘC (tuân thủ nghiêm):
@@ -36,17 +42,12 @@ def _comment_matches_trigger(body: str, keywords: list[str]) -> bool:
     return False
 
 
-def build_prompt(
+def build_base_prompt(
     event: str,
     payload: dict[str, Any],
     *,
     trigger_keywords: list[str] | None = None,
 ) -> str | None:
-    """
-    Return ``None`` to skip running Claude for this delivery.
-
-    ``trigger_keywords`` is used for ``issue_comment`` events (substring match, case-insensitive).
-    """
     repo = payload.get("repository") or {}
     full_name = repo.get("full_name") or "unknown/repo"
     html_url = repo.get("html_url") or ""
@@ -68,7 +69,7 @@ def build_prompt(
         if messages:
             head += "Commit messages (rút gọn):\n" + "\n".join(f"- {m}" for m in messages) + "\n"
         head += (
-            "\nHãy `git pull` đã được service chạy trước khi gọi bạn; làm việc trong working tree hiện tại.\n"
+            "\nRepo đã được clone/cập nhật trong workspace. Làm việc trong working tree hiện tại.\n"
             "Đọc diff/commit vừa có (nếu cần), chạy test/lint phù hợp. Nếu phát hiện lỗi hoặc CI sẽ fail, "
             "sửa trên branch mới và chuẩn bị PR.\n"
         )
@@ -149,10 +150,56 @@ def build_prompt(
         )
         return f"{SAFETY_RULES}\n\n{text}"
 
-    # Fallback: generic
     text = (
         f"Sự kiện GitHub: `{event}`.\n"
         f"Payload (rút gọn JSON):\n{_json_snippet(payload)}\n\n"
         "Hãy đánh giá xem có cần hành động trên codebase không; nếu có, làm trên branch mới và PR.\n"
     )
     return f"{SAFETY_RULES}\n\n{text}"
+
+
+def _rag_context(settings: Settings, state: JannusState) -> str:
+    if not settings.rag_enabled or not state.get("repo_local_path"):
+        return ""
+    try:
+        from jannus.rag.retriever import retrieve_context
+
+        q = (state.get("planner_summary") or "") + " " + json.dumps(state.get("payload") or {}, default=str)[:2000]
+        return retrieve_context(settings, state["repo_local_path"], q[:4000])
+    except Exception as e:
+        logger.warning("RAG optional context failed: %s", e)
+        return ""
+
+
+def build_prompt_for_graph(settings: Settings, state: JannusState) -> dict[str, Any]:
+    """Return partial state update with ``prompt`` or ``skip_graph`` / ``error``."""
+    if state.get("skip_graph"):
+        return {}
+    event = state.get("event") or ""
+    payload = state.get("payload") or {}
+    kws = settings.parsed_trigger_keywords()
+    base = build_base_prompt(event, payload, trigger_keywords=kws)
+    if base is None:
+        return {"skip_graph": True, "error": "no prompt for this event"}
+
+    extra_parts: list[str] = []
+    if state.get("planner_summary"):
+        extra_parts.append(f"[Planner]\n{state['planner_summary']}\n")
+    rag = _rag_context(settings, state)
+    if rag:
+        extra_parts.append(f"[Optional context from repo index]\n{rag}\n")
+    if state.get("review_feedback"):
+        extra_parts.append(f"[Reviewer feedback — address this]\n{state['review_feedback']}\n")
+    if state.get("human_response"):
+        extra_parts.append(f"[Human guidance]\n{state['human_response']}\n")
+
+    prefix = "\n".join(extra_parts) if extra_parts else ""
+    full = f"{prefix}\n{base}" if prefix else base
+
+    if settings.webhook_dry_run:
+        logger.info("WEBHOOK_DRY_RUN prompt (%s chars):\n%s", len(full), full[:4000])
+
+    out: dict[str, Any] = {"prompt": full}
+    if state.get("human_response"):
+        out["human_response"] = None
+    return out

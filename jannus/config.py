@@ -4,6 +4,10 @@ from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+def _default_workspaces_dir() -> Path:
+    return Path(__file__).resolve().parent.parent / "workspaces"
+
+
 class Settings(BaseSettings):
     model_config = SettingsConfigDict(
         env_file=".env",
@@ -11,9 +15,9 @@ class Settings(BaseSettings):
         extra="ignore",
     )
 
-    repo_path: Path = Field(
-        ...,
-        description="Local clone path; service runs git pull here before Claude.",
+    workspaces_dir: Path = Field(
+        default_factory=_default_workspaces_dir,
+        description="Directory for persistent git clones and local indexes.",
     )
     webhook_secret: str = Field(
         default="",
@@ -39,8 +43,21 @@ class Settings(BaseSettings):
     claude_timeout: int = Field(default=600, ge=30, le=3600)
     webhook_dry_run: bool = Field(
         default=False,
-        description="If true, log prompt only; skip git pull and claude (safe for local tests).",
+        description="If true, skip git and claude; graph still runs with dry-run flags.",
     )
+    max_attempts: int = Field(default=3, ge=1, le=10, description="Reviewer loop limit before human escalation.")
+    rag_enabled: bool = Field(default=False, description="Enable LlamaIndex + Chroma RAG in prompt builder.")
+
+    openai_api_key: str = Field(default="", description="OpenAI API key for planner and reviewer agents.")
+    openai_model: str = Field(default="gpt-4o", description="Model for LangChain agents.")
+
+    telegram_bot_token: str = Field(default="", description="Telegram bot token for notifier.")
+    telegram_chat_id: str = Field(default="", description="Telegram chat id to send notifications.")
+
+    langchain_tracing_v2: bool = Field(default=False)
+    langchain_api_key: str = Field(default="")
+    langchain_project: str = Field(default="jannus")
+
     host: str = Field(default="0.0.0.0")
     port: int = Field(default=8765, ge=1, le=65535)
 
@@ -63,6 +80,14 @@ class Settings(BaseSettings):
         if not self.claude_extra_args.strip():
             return []
         return self.claude_extra_args.split()
+
+    @property
+    def checkpoint_db_path(self) -> Path:
+        return self.workspaces_dir / ".jannus_state.db"
+
+    @property
+    def registry_path(self) -> Path:
+        return self.workspaces_dir / "registry.json"
 
 
 _settings: Settings | None = None

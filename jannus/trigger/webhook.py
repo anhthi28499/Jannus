@@ -1,17 +1,20 @@
-"""Layer 1: Trigger — FastAPI webhook endpoint and request validation."""
+"""Layer 1: Trigger — FastAPI webhook, HMAC, LangGraph orchestration."""
 
 from __future__ import annotations
 
 import json
 import logging
+import threading
+import uuid
 from typing import Any
 
 import uvicorn
 from fastapi import BackgroundTasks, FastAPI, HTTPException, Request, Response
 
+from jannus.agents.graph import get_compiled_graph
+from jannus.agents.prompt_builder import build_base_prompt
+from jannus.agents.state import JannusState
 from jannus.config import get_settings, load_settings
-from jannus.executor.runner import webhook_worker
-from jannus.prompt.builder import build_prompt
 from jannus.trigger.security import verify_github_signature
 
 logger = logging.getLogger("jannus.trigger")
@@ -20,12 +23,37 @@ logging.basicConfig(
     format="%(asctime)s %(levelname)s %(name)s: %(message)s",
 )
 
-app = FastAPI(title="Jannus", version="0.1.0", description="GitHub webhook → Claude Code")
+_graph_lock = threading.Lock()
+
+app = FastAPI(
+    title="Jannus",
+    version="0.2.0",
+    description="GitHub webhook → LangGraph multi-agent → Claude Code",
+)
 
 
 @app.get("/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+def _run_graph_job(event: str, payload: dict[str, Any], thread_id: str) -> None:
+    settings = get_settings()
+    initial: JannusState = {
+        "event": event,
+        "payload": payload,
+        "thread_id": thread_id,
+        "attempt": 0,
+        "max_attempts": settings.max_attempts,
+        "review_result": "pending",
+    }
+    graph = get_compiled_graph()
+    cfg: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+    try:
+        with _graph_lock:
+            graph.invoke(initial, config=cfg)
+    except Exception:
+        logger.exception("Graph invoke failed for thread_id=%s", thread_id)
 
 
 @app.post("/webhook")
@@ -67,21 +95,20 @@ async def github_webhook(
         )
 
     kws = settings.parsed_trigger_keywords()
-    prompt = build_prompt(event, payload, trigger_keywords=kws)
-    if prompt is None:
+    if build_base_prompt(event, payload, trigger_keywords=kws) is None:
         return Response(
             content=json.dumps({"ok": True, "skipped": True, "reason": "no prompt for this event"}),
             media_type="application/json",
         )
 
-    delivery = request.headers.get("X-GitHub-Delivery", "")
+    delivery = request.headers.get("X-GitHub-Delivery", "") or str(uuid.uuid4())
     logger.info(
-        "Queue job event=%s delivery=%s repo=%s",
+        "Queue graph job event=%s delivery=%s repo=%s",
         event,
         delivery,
         repo or "?",
     )
-    background_tasks.add_task(webhook_worker, settings, prompt)
+    background_tasks.add_task(_run_graph_job, event, payload, delivery)
 
     return Response(
         content=json.dumps(
@@ -89,11 +116,41 @@ async def github_webhook(
                 "ok": True,
                 "accepted": True,
                 "event": event,
-                "delivery": delivery,
+                "thread_id": delivery,
             }
         ),
         media_type="application/json",
         status_code=202,
+    )
+
+
+@app.post("/callback")
+async def human_callback(request: Request) -> Response:
+    """Resume graph after human input (Telegram / external client)."""
+    try:
+        body = await request.json()
+    except Exception:
+        raise HTTPException(status_code=400, detail="Invalid JSON") from None
+
+    thread_id = body.get("thread_id")
+    message = body.get("message", "")
+    if not thread_id:
+        raise HTTPException(status_code=400, detail="thread_id required")
+
+    from langgraph.types import Command
+
+    graph = get_compiled_graph()
+    cfg: dict[str, Any] = {"configurable": {"thread_id": thread_id}}
+    try:
+        with _graph_lock:
+            graph.invoke(Command(resume=message), config=cfg)
+    except Exception:
+        logger.exception("Callback resume failed thread_id=%s", thread_id)
+        raise HTTPException(status_code=500, detail="Resume failed") from None
+
+    return Response(
+        content=json.dumps({"ok": True, "resumed": True, "thread_id": thread_id}),
+        media_type="application/json",
     )
 
 

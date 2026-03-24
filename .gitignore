@@ -8,3 +8,7 @@ __pycache__/
 .mypy_cache/
 .DS_Store
 .gitnexus
+
+# Persistent workspaces (clones, Chroma, checkpoints)
+workspaces/*
+!workspaces/.gitkeep
