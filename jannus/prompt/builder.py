@@ -1,3 +1,7 @@
+"""Layer 2: Prompt — GitHub event + payload → Claude instruction string."""
+
+from __future__ import annotations
+
 import json
 from typing import Any
 
@@ -22,9 +26,26 @@ def _json_snippet(obj: Any, max_len: int = 8000) -> str:
     return s
 
 
-def build_prompt(event: str, payload: dict[str, Any]) -> str | None:
+def _comment_matches_trigger(body: str, keywords: list[str]) -> bool:
+    if not body.strip() or not keywords:
+        return False
+    lower = body.lower()
+    for kw in keywords:
+        if kw.lower() in lower:
+            return True
+    return False
+
+
+def build_prompt(
+    event: str,
+    payload: dict[str, Any],
+    *,
+    trigger_keywords: list[str] | None = None,
+) -> str | None:
     """
-    Return None to skip running Claude for this delivery.
+    Return ``None`` to skip running Claude for this delivery.
+
+    ``trigger_keywords`` is used for ``issue_comment`` events (substring match, case-insensitive).
     """
     repo = payload.get("repository") or {}
     full_name = repo.get("full_name") or "unknown/repo"
@@ -67,6 +88,30 @@ def build_prompt(event: str, payload: dict[str, Any]) -> str | None:
             f"URL: {url}\n"
             f"Mô tả:\n{body}\n\n"
             "Hãy phân tích codebase trong thư mục hiện tại, triển khai fix hoặc cải tiến phù hợp trên branch mới, "
+            "chạy kiểm tra cần thiết, push và tạo PR.\n"
+        )
+        return f"{SAFETY_RULES}\n\n{text}"
+
+    if event == "issue_comment":
+        action = payload.get("action")
+        if action != "created":
+            return None
+        comment = payload.get("comment") or {}
+        comment_body = comment.get("body") or ""
+        kws = trigger_keywords or []
+        if not _comment_matches_trigger(comment_body, kws):
+            return None
+        issue = payload.get("issue") or {}
+        title = issue.get("title") or ""
+        issue_body = issue.get("body") or ""
+        num = issue.get("number")
+        url = issue.get("html_url") or ""
+        text = (
+            f"Có comment yêu cầu xử lý trên issue/PR `{full_name}` (#{num}): {title}\n"
+            f"URL: {url}\n"
+            f"Mô tả issue:\n{issue_body}\n\n"
+            f"Comment:\n{comment_body}\n\n"
+            "Hãy phân tích codebase, thực hiện thay đổi phù hợp trên branch mới, "
             "chạy kiểm tra cần thiết, push và tạo PR.\n"
         )
         return f"{SAFETY_RULES}\n\n{text}"

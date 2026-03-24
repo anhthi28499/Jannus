@@ -27,6 +27,10 @@ class Settings(BaseSettings):
         default="",
         description="Comma-separated owner/repo; empty = any repository.",
     )
+    trigger_keywords: str = Field(
+        default="/fix,/autofix,@jannus",
+        description="Comma-separated substrings; issue_comment must contain one to trigger.",
+    )
     claude_bin: str = Field(default="claude")
     claude_extra_args: str = Field(
         default="",
@@ -50,11 +54,26 @@ class Settings(BaseSettings):
             return set()
         return {x.strip().lower() for x in self.repo_allowlist.split(",") if x.strip()}
 
+    def parsed_trigger_keywords(self) -> list[str]:
+        if not self.trigger_keywords.strip():
+            return []
+        return [x.strip() for x in self.trigger_keywords.split(",") if x.strip()]
+
     def claude_extra_argv(self) -> list[str]:
         if not self.claude_extra_args.strip():
             return []
         return self.claude_extra_args.split()
 
 
+_settings: Settings | None = None
+
+
 def load_settings() -> Settings:
     return Settings()
+
+
+def get_settings() -> Settings:
+    global _settings
+    if _settings is None:
+        _settings = load_settings()
+    return _settings
